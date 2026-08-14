@@ -1,6 +1,7 @@
 # notion-obsidian-sync
 
-Manual, two-way sync between a Notion page tree and an Obsidian folder.
+Manual, two-way sync between one or more Notion page trees and matching
+Obsidian folders ("pairs"), defined in `sync-pairs.json`.
 
 - Trigger: manual. Nothing runs automatically or in the background.
 - Conflict policy: if a file changed in Obsidian AND its matching page changed
@@ -28,20 +29,35 @@ Manual, two-way sync between a Notion page tree and an Obsidian folder.
    - Go to https://www.notion.so/my-integrations
    - New integration → give it a name → copy the "Internal Integration Secret"
 
-4. Share your Notion "Personal Essays" page with that integration:
+4. For **each** root page you want to sync (e.g. "Personal Essays", "Letters
+   to self"), share it with that integration:
    - Open the page in Notion → "..." menu (top right) → Connections → add
      your integration. Without this the API cannot see the page.
 
 5. Configure:
    ```
    cp .env.example .env
+   cp sync-pairs.example.json sync-pairs.json
    ```
    Edit `.env`:
    - `NOTION_API_KEY` — the secret from step 3
-   - `NOTION_ROOT_PAGE_ID` — already filled in for your Personal Essays page
    - `OBSIDIAN_VAULT_PATH` — full path to your vault, e.g.
      `/Users/pranamya/Documents/YourVault`
-   - `OBSIDIAN_ROOT_FOLDER` — leave as `Personal Essays`
+
+   Edit `sync-pairs.json` — one entry per root you want synced:
+   - `name` — any short label, used in logs and to key `sync-state.json`
+   - `notionRootPageId` — the page ID from its Notion URL
+   - `obsidianRootFolder` — the matching top-level folder name in your vault
+
+   Adding a new pair whose two sides already have matching content? Seed its
+   baseline first so the first real run doesn't treat "no prior state" as
+   "everything just changed" (which would duplicate everything into
+   Conflicts):
+   ```
+   node sync.js --seed <pair-name>
+   ```
+   This only reads both sides and records their current hashes — it never
+   creates, pushes, or overwrites anything.
 
 6. Make the double-click launcher executable (one time):
    ```
@@ -54,13 +70,15 @@ Either:
 - Double-click `sync.command` in Finder, or
 - Run `npm run sync` from the terminal.
 
-Each run prints what it created, updated, or flagged as a conflict.
+One run syncs every pair in `sync-pairs.json` and prints one combined total
+of what it created, updated, or flagged as a conflict, across all of them.
 
 ## Files this creates next to the script
 
-- `sync-state.json` — tracks what was last synced. This is how the script
-  knows what changed since last time. Don't delete it casually — deleting it
-  makes every file look "new" on the next run.
+- `sync-state.json` — tracks what was last synced, per pair. This is how the
+  script knows what changed since last time. Don't delete it casually —
+  deleting a pair's entry makes every one of its files look "new" on the
+  next run.
 - `conflicts.log` — a running log of every conflict and how it was resolved
   (both versions kept, with filenames).
 

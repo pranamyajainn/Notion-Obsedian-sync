@@ -1,4 +1,5 @@
 node_modules/
 .env
+sync-pairs.json
 sync-state.json
 conflicts.log

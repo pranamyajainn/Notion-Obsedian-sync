@@ -1,11 +1,18 @@
 #!/usr/bin/env node
 /**
- * Manual two-way sync between a Notion page tree and an Obsidian folder.
+ * Manual two-way sync between one or more Notion page trees and matching
+ * Obsidian folders, defined as "pairs" in sync-pairs.json.
  *
  * Trigger: manual only. Run `npm run sync` or double-click sync.command.
  * Conflict policy: if both sides changed since the last sync, BOTH versions
- * are kept as separate copies. Nothing is ever silently overwritten.
+ * are kept as separate copies under a "Conflicts" folder/page at that pair's
+ * root, with their original names (no suffix). Originals are never touched.
  * Deletions are never propagated automatically.
+ *
+ * `node sync.js --seed <pairName>` records the current state of a pair as
+ * its baseline without creating, pushing, or overwriting anything. Use this
+ * once when adding a new pair whose two sides already match, so the first
+ * real run doesn't mistake "no prior state" for "both sides just changed".
  */
 
 require('dotenv').config();
@@ -17,11 +24,9 @@ const { NotionToMarkdown } = require('notion-to-md');
 const { markdownToBlocks } = require('@tryfabric/martian');
 
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
-const NOTION_ROOT_PAGE_ID = process.env.NOTION_ROOT_PAGE_ID;
 const OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH;
-const OBSIDIAN_ROOT_FOLDER = process.env.OBSIDIAN_ROOT_FOLDER || '';
 
-if (!NOTION_API_KEY || !NOTION_ROOT_PAGE_ID || !OBSIDIAN_VAULT_PATH) {
+if (!NOTION_API_KEY || !OBSIDIAN_VAULT_PATH) {
   console.error('Missing required env vars. Copy .env.example to .env and fill it in.');
   process.exit(1);
 }
@@ -29,6 +34,7 @@ if (!NOTION_API_KEY || !NOTION_ROOT_PAGE_ID || !OBSIDIAN_VAULT_PATH) {
 const notion = new Client({ auth: NOTION_API_KEY });
 const n2m = new NotionToMarkdown({ notionClient: notion });
 
+const PAIRS_FILE = path.join(__dirname, 'sync-pairs.json');
 const STATE_FILE = path.join(__dirname, 'sync-state.json');
 const CONFLICT_LOG = path.join(__dirname, 'conflicts.log');
 
@@ -37,21 +43,42 @@ function hash(content) {
   return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
-async function loadState() {
+async function loadPairs() {
+  let raw;
   try {
-    const raw = await fs.readFile(STATE_FILE, 'utf8');
-    return JSON.parse(raw);
+    raw = await fs.readFile(PAIRS_FILE, 'utf8');
   } catch {
-    return { items: {} };
+    console.error('Missing sync-pairs.json. Copy sync-pairs.example.json to sync-pairs.json and fill it in.');
+    process.exit(1);
   }
+  const pairs = JSON.parse(raw);
+  if (!Array.isArray(pairs) || pairs.length === 0) {
+    console.error('sync-pairs.json must be a non-empty array of {name, notionRootPageId, obsidianRootFolder}.');
+    process.exit(1);
+  }
+  return pairs;
+}
+
+async function loadState() {
+  let raw;
+  try {
+    raw = JSON.parse(await fs.readFile(STATE_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+  // Migrate the old single-pair format ({ items: {...} }) under "personal-essays".
+  if (raw.items && !raw['personal-essays']) {
+    return { 'personal-essays': { items: raw.items } };
+  }
+  return raw;
 }
 
 async function saveState(state) {
   await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
 }
 
-async function logConflict(message) {
-  const line = `[${new Date().toISOString()}] ${message}\n`;
+async function logConflict(pairName, message) {
+  const line = `[${new Date().toISOString()}] (${pairName}) ${message}\n`;
   await fs.appendFile(CONFLICT_LOG, line, 'utf8');
   console.log('CONFLICT:', message);
 }
@@ -83,8 +110,8 @@ async function walkObsidian(dir, relBase = '') {
   return items;
 }
 
-async function writeObsidianFile(relPath, content) {
-  const fsPath = path.join(OBSIDIAN_VAULT_PATH, OBSIDIAN_ROOT_FOLDER, `${relPath}.md`);
+async function writeObsidianFile(obsidianRootFolder, relPath, content) {
+  const fsPath = path.join(OBSIDIAN_VAULT_PATH, obsidianRootFolder, `${relPath}.md`);
   await fs.mkdir(path.dirname(fsPath), { recursive: true });
   await fs.writeFile(fsPath, content, 'utf8');
   return fsPath;
@@ -154,33 +181,34 @@ async function createNotionPage(parentPageId, title, markdown) {
   return page.id;
 }
 
-let conflictsPageIdCache = null;
-
-// Finds (or creates) a "Conflicts" child page directly under the root, used
-// to hold both-sides-changed copies with their plain, unsuffixed titles.
-async function getOrCreateConflictsPage() {
-  if (conflictsPageIdCache) return conflictsPageIdCache;
-  const children = await getAllBlockChildren(NOTION_ROOT_PAGE_ID);
+// Finds (or creates) a "Conflicts" child page directly under a pair's root,
+// used to hold both-sides-changed copies with their plain, unsuffixed titles.
+async function getOrCreateConflictsPage(rootPageId, cache) {
+  if (cache.id) return cache.id;
+  const children = await getAllBlockChildren(rootPageId);
   const existing = children.find((b) => b.type === 'child_page' && b.child_page.title === 'Conflicts');
-  conflictsPageIdCache = existing ? existing.id : await createNotionPage(NOTION_ROOT_PAGE_ID, 'Conflicts', '');
-  return conflictsPageIdCache;
+  cache.id = existing ? existing.id : await createNotionPage(rootPageId, 'Conflicts', '');
+  return cache.id;
 }
 
-function findParentPageId(notionTree, relPath) {
+function findParentPageId(notionTree, relPath, rootPageId) {
   const parentRel = relPath.split('/').slice(0, -1).join('/');
-  if (!parentRel) return NOTION_ROOT_PAGE_ID;
-  return notionTree[parentRel]?.pageId || NOTION_ROOT_PAGE_ID;
+  if (!parentRel) return rootPageId;
+  return notionTree[parentRel]?.pageId || rootPageId;
 }
 
-// ---------- Main ----------
+// ---------- Sync one pair ----------
 
-async function main() {
+async function syncPair(pair, state, totals, seedOnly) {
+  const { name, notionRootPageId, obsidianRootFolder } = pair;
+  console.log(`\n== ${name} ==`);
+
   console.log('Reading Obsidian side...');
-  const obsidianRoot = path.join(OBSIDIAN_VAULT_PATH, OBSIDIAN_ROOT_FOLDER);
+  const obsidianRoot = path.join(OBSIDIAN_VAULT_PATH, obsidianRootFolder);
   const obsidianTree = await walkObsidian(obsidianRoot);
 
   console.log('Reading Notion side...');
-  const notionTree = await walkNotion(NOTION_ROOT_PAGE_ID);
+  const notionTree = await walkNotion(notionRootPageId);
 
   // The "Conflicts" folder/page is a holding area for both-sides-changed
   // copies, not regular content — exclude it from the normal diff entirely.
@@ -191,12 +219,10 @@ async function main() {
     if (key === 'Conflicts' || key.startsWith('Conflicts/')) delete notionTree[key];
   }
 
-  const state = await loadState();
+  if (!state[name]) state[name] = { items: {} };
+  const pairState = state[name];
   const allKeys = new Set([...Object.keys(obsidianTree), ...Object.keys(notionTree)]);
-
-  let created = 0;
-  let updated = 0;
-  let conflicts = 0;
+  const conflictsPageCache = {};
 
   for (const key of allKeys) {
     const ob = obsidianTree[key];
@@ -204,30 +230,36 @@ async function main() {
 
     if (ob?.type === 'folder' || no?.type === 'folder') continue;
 
-    const prev = state.items[key];
+    const prev = pairState.items[key];
+
+    if (seedOnly) {
+      // Only record a baseline for items that already exist on both sides.
+      // Never create, push, or overwrite anything.
+      if (ob && no) {
+        pairState.items[key] = {
+          obsidianHash: hash(ob.content),
+          notionHash: hash(no.content),
+          notionPageId: no.pageId,
+        };
+        console.log(`Seeded baseline: ${key}`);
+      }
+      continue;
+    }
 
     if (ob && !no) {
-      const parentId = findParentPageId(notionTree, key);
+      const parentId = findParentPageId(notionTree, key, notionRootPageId);
       const title = key.split('/').pop();
       const newPageId = await createNotionPage(parentId, title, ob.content);
-      state.items[key] = {
-        obsidianHash: hash(ob.content),
-        notionHash: hash(ob.content),
-        notionPageId: newPageId,
-      };
-      created++;
+      pairState.items[key] = { obsidianHash: hash(ob.content), notionHash: hash(ob.content), notionPageId: newPageId };
+      totals.created++;
       console.log(`Created in Notion: ${key}`);
       continue;
     }
 
     if (no && !ob) {
-      await writeObsidianFile(key, no.content);
-      state.items[key] = {
-        obsidianHash: hash(no.content),
-        notionHash: hash(no.content),
-        notionPageId: no.pageId,
-      };
-      created++;
+      await writeObsidianFile(obsidianRootFolder, key, no.content);
+      pairState.items[key] = { obsidianHash: hash(no.content), notionHash: hash(no.content), notionPageId: no.pageId };
+      totals.created++;
       console.log(`Created in Obsidian: ${key}`);
       continue;
     }
@@ -242,36 +274,64 @@ async function main() {
 
       if (obChanged && !noChanged) {
         await writeNotionPage(no.pageId, ob.content);
-        state.items[key] = { obsidianHash: obHash, notionHash: obHash, notionPageId: no.pageId };
-        updated++;
+        pairState.items[key] = { obsidianHash: obHash, notionHash: obHash, notionPageId: no.pageId };
+        totals.updated++;
         console.log(`Pushed Obsidian -> Notion: ${key}`);
       } else if (noChanged && !obChanged) {
-        await writeObsidianFile(key, no.content);
-        state.items[key] = { obsidianHash: noHash, notionHash: noHash, notionPageId: no.pageId };
-        updated++;
+        await writeObsidianFile(obsidianRootFolder, key, no.content);
+        pairState.items[key] = { obsidianHash: noHash, notionHash: noHash, notionPageId: no.pageId };
+        totals.updated++;
         console.log(`Pulled Notion -> Obsidian: ${key}`);
       } else {
         const title = key.split('/').pop();
-        const conflictsPageId = await getOrCreateConflictsPage();
+        const conflictsPageId = await getOrCreateConflictsPage(notionRootPageId, conflictsPageCache);
 
         await createNotionPage(conflictsPageId, title, ob.content);
-        await writeObsidianFile(`Conflicts/${title}`, no.content);
+        await writeObsidianFile(obsidianRootFolder, `Conflicts/${title}`, no.content);
 
         await logConflict(
+          name,
           `${key}: both sides changed. Obsidian version saved to Notion under "Conflicts/${title}". ` +
             `Notion version saved to Obsidian at "Conflicts/${title}.md". Originals on both sides left untouched. ` +
-            `Note: if this exact essay conflicts again later, its Conflicts copy will be overwritten (no suffix is added).`
+            `Note: if this exact item conflicts again later, its Conflicts copy will be overwritten (no suffix is added).`
         );
 
-        state.items[key] = { obsidianHash: obHash, notionHash: noHash, notionPageId: no.pageId };
-        conflicts++;
+        pairState.items[key] = { obsidianHash: obHash, notionHash: noHash, notionPageId: no.pageId };
+        totals.conflicts++;
       }
     }
   }
+}
+
+// ---------- Main ----------
+
+async function main() {
+  const args = process.argv.slice(2);
+  const seedIndex = args.indexOf('--seed');
+  const seedPairName = seedIndex !== -1 ? args[seedIndex + 1] : null;
+
+  const pairs = await loadPairs();
+  const state = await loadState();
+  const totals = { created: 0, updated: 0, conflicts: 0 };
+
+  const pairsToRun = seedPairName ? pairs.filter((p) => p.name === seedPairName) : pairs;
+  if (seedPairName && pairsToRun.length === 0) {
+    console.error(`No pair named "${seedPairName}" in sync-pairs.json`);
+    process.exit(1);
+  }
+
+  for (const pair of pairsToRun) {
+    await syncPair(pair, state, totals, Boolean(seedPairName));
+  }
 
   await saveState(state);
-  console.log(`\nDone. Created: ${created}, Updated: ${updated}, Conflicts: ${conflicts}.`);
-  if (conflicts > 0) console.log('See conflicts.log for details.');
+
+  if (seedPairName) {
+    console.log(`\nSeeded baseline for "${seedPairName}". Nothing was created, changed, or pushed.`);
+  } else {
+    console.log(`\nDone. Created: ${totals.created}, Updated: ${totals.updated}, Conflicts: ${totals.conflicts}.`);
+    if (totals.conflicts > 0) console.log('See conflicts.log for details.');
+  }
 }
 
 main().catch((err) => {
